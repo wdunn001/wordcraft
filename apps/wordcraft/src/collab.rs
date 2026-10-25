@@ -7,13 +7,9 @@
 //! the UI.
 //!
 //! The relay never holds a document. It assigns a strictly increasing sequence to every edit and
-//! fans it out, and each peer applies edits in that order.
-//!
-//! A word processor needs one thing a spreadsheet does not. `cell.set` carries its own address, so
-//! it means the same thing wherever it lands. `text.insert` and `edit.delete` mean "here", and
-//! here is wherever the caret is. So the sender's selection travels with the command, under a key
-//! of our own in its parameters, and the receiver runs the command against that selection. Without
-//! it every remote keystroke would land at the reader's caret and scramble their own paragraph.
+//! fans it out. Typing (`text.insert`) is a CRDT: each paragraph is a `TextDoc`, the ops travel
+//! as `crdt.text` with no lock, and both insertions in the same sentence survive. Commands that
+//! do not commute (new paragraph, styles, file ops) still take a region lock.
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -21,7 +17,10 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use craft_collab::native::NativeHub;
 use craft_collab::{Effect, Hub, ServerMsg, Session as Wire};
 use serde_json::Value as Json;
+use wordcraft_engine::doc::{Pos, StoryRef};
 use wordcraft_engine::{CollabSink, Selection, Session as Engine};
+
+use crate::crdt::{self, Crdt, CrdtText};
 
 /// The key the sender's selection travels under.
 ///
@@ -153,6 +152,7 @@ pub struct Link {
     hub: NativeHub,
     _rt: tokio::runtime::Runtime,
     wire: Wire,
+    crdt: Crdt,
     local: Receiver<Edit>,
     outbound: Sender<Edit>,
     /// Lines for the user, drained by the app each frame.
@@ -218,15 +218,35 @@ impl Link {
 
         let (outbound, local) = channel();
         log::info!("collab: joining {doc} on {relay}");
-        Some(Link { hub, _rt: rt, wire, local, outbound, notices: Vec::new(), roster: Vec::new(), was_connected: true })
+        Some(Link {
+            hub,
+            _rt: rt,
+            wire,
+            crdt: Crdt::new(1),
+            local,
+            outbound,
+            notices: Vec::new(),
+            roster: Vec::new(),
+            was_connected: true,
+        })
     }
 
     /// Hands the engine the outbound sink.
     ///
     /// Call once, on the UI thread, after the window exists. Edits made before this returns stay
     /// local.
-    pub fn bind(&self, engine: &mut Engine) {
+    pub fn bind(&mut self, engine: &mut Engine) {
+        self.seed_from(engine);
         engine.collab = Some(Arc::new(Outbound(self.outbound.clone())));
+    }
+
+    fn seed_from(&mut self, engine: &Engine) {
+        for path in engine.doc.para_paths(StoryRef::Body) {
+            if let Some(para) = engine.doc.para(StoryRef::Body, &path) {
+                let at = Pos { story: StoryRef::Body, path, off: 0 };
+                self.crdt.seed(&wordcraft_engine::collab::scope_of(&at), &para.text);
+            }
+        }
     }
 
     /// One frame's work: send what the user did, apply what arrived.
@@ -249,7 +269,7 @@ impl Link {
 
         // Outbound next, so a local edit is on its way before time goes on applying remote ones.
         while let Ok(edit) = self.local.try_recv() {
-            let msg = self.wire.submit(edit.id, edit.params, Some(edit.scope));
+            let msg = self.outbound_msg(edit, engine);
             if let Err(e) = self.hub.send(msg) {
                 self.notices.push(format!("that edit did not reach the others: {e}"));
             }
@@ -268,6 +288,9 @@ impl Link {
                 }
             }
             let effects = self.wire.handle(msg);
+            if let Some(peer) = self.wire.me() {
+                self.crdt.set_space(crdt::space_for(peer));
+            }
             for effect in effects {
                 self.act(engine, effect);
             }
@@ -279,10 +302,14 @@ impl Link {
             // The whole point. Applied through `apply_remote`, which runs it against the sender's
             // selection and does not hand it straight back as a local edit.
             Effect::Apply { command, params } => {
-                let (params, at) = take_position(params);
-                if let Err(e) = engine.apply_remote(&command, &params, at) {
-                    log::warn!("collab: a remote {command} did not apply: {e}");
-                    self.notices.push(format!("could not apply a change from another editor: {e}"));
+                if command == craft_collab::CRDT_TEXT {
+                    self.apply_crdt(engine, params);
+                } else {
+                    let (params, at) = take_position(params);
+                    if let Err(e) = engine.apply_remote(&command, &params, at) {
+                        log::warn!("collab: a remote {command} did not apply: {e}");
+                        self.notices.push(format!("could not apply a change from another editor: {e}"));
+                    }
                 }
             }
             Effect::Confirmed { .. } => {}
@@ -318,6 +345,55 @@ impl Link {
                     log::warn!("collab: a resync request never left: {e}");
                 }
             }
+        }
+    }
+
+    fn outbound_msg(&mut self, edit: Edit, engine: &Engine) -> craft_collab::ClientMsg {
+        if edit.id == "text.insert" {
+            if let Some(msg) = self.crdt_insert(&edit, engine) {
+                return msg;
+            }
+        }
+        self.wire.submit(edit.id, edit.params, Some(edit.scope))
+    }
+
+    fn crdt_insert(&mut self, edit: &Edit, engine: &Engine) -> Option<craft_collab::ClientMsg> {
+        let inserted = edit.params.get("text")?.as_str()?;
+        if inserted.is_empty() {
+            return None;
+        }
+        let at: Selection = edit.params.get(AT).cloned().and_then(|v| serde_json::from_value(v).ok())?;
+        let pos = wordcraft_engine::collab::parse_scope(&edit.scope)?;
+        let para = engine.doc.para_at(&pos)?;
+        if self.crdt.render(&edit.scope).is_none() {
+            let prefix = para.text.get(..at.focus.off.min(para.text.len())).unwrap_or("");
+            let start = at.focus.off.saturating_add(inserted.len());
+            let suffix = para.text.get(start..).unwrap_or("");
+            let mut before = String::with_capacity(prefix.len() + suffix.len());
+            before.push_str(prefix);
+            before.push_str(suffix);
+            self.crdt.seed(&edit.scope, &before);
+        }
+        let prefix = para.text.get(..at.focus.off.min(para.text.len())).unwrap_or("");
+        let ops = self.crdt.local_insert(&edit.scope, prefix.chars().count(), inserted);
+        let payload = CrdtText { scope: edit.scope.clone(), ops };
+        let params = serde_json::to_value(&payload).ok()?;
+        Some(self.wire.submit_crdt(craft_collab::CRDT_TEXT, params))
+    }
+
+    fn apply_crdt(&mut self, engine: &mut Engine, params: Json) {
+        let payload: CrdtText = match serde_json::from_value(params) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("collab: a crdt.text payload did not decode: {e}");
+                self.notices.push("could not apply a change from another editor".to_owned());
+                return;
+            }
+        };
+        let rendered = self.crdt.apply(&payload.scope, &payload.ops);
+        if let Err(e) = engine.apply_crdt_paragraph(&payload.scope, &rendered) {
+            log::warn!("collab: a remote crdt.text did not apply: {e}");
+            self.notices.push(format!("could not apply a change from another editor: {e}"));
         }
     }
 }

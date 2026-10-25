@@ -1666,6 +1666,40 @@ impl Session {
         out
     }
 
+    /// Replace one paragraph's characters with the rendered CRDT text.
+    ///
+    /// Typing from another peer arrives as `crdt.text` operations. Those merge in the app's
+    /// `TextDoc`; this writes the result into the document. It is not reported to
+    /// [`CollabSink`], so it does not bounce. Formatting collapses to one run: v1 is characters,
+    /// not styles.
+    pub fn apply_crdt_paragraph(&mut self, scope: &str, text: &str) -> Result<(), CmdError> {
+        let Some(at) = crate::collab::parse_scope(scope) else {
+            return Err(CmdError::Failed(format!("unknown paragraph {scope}")));
+        };
+        let was = std::mem::replace(&mut self.applying_remote, true);
+        let para = match self.doc.para_mut(at.story, &at.path) {
+            Ok(p) => p,
+            Err(e) => {
+                self.applying_remote = was;
+                return Err(e.into());
+            }
+        };
+        para.text = text.to_owned();
+        let props = para.mark.clone();
+        para.runs = if para.text.is_empty() {
+            Vec::new()
+        } else {
+            vec![wordcraft_doc::Run { len: para.text.len(), props }]
+        };
+        para.touch();
+        self.clamp_selection();
+        self.applying_remote = was;
+        self.touch();
+        self.history.clear();
+        self.redo.clear();
+        Ok(())
+    }
+
     /// How long the paragraph a position names is, when it names one.
     fn para_len(&self, at: &Pos) -> Option<usize> {
         self.doc.para_at(at).map(|p| p.len())

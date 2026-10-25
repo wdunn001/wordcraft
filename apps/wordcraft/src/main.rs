@@ -16,6 +16,7 @@ mod clipboard;
 mod cloud;
 mod collab;
 mod control_server;
+mod crdt;
 mod default_apps;
 mod file_dialogs;
 #[cfg(any(target_os = "windows", target_os = "macos", test))]
@@ -59,7 +60,7 @@ impl eframe::App for App {
         apple_events::poll(&self.events, &mut self.doc, ctx);
         if self.collab.is_none() {
             match self.collab_rx.as_ref().map(std::sync::mpsc::Receiver::try_recv) {
-                Some(Ok(link)) => {
+                Some(Ok(mut link)) => {
                     link.bind(&mut self.doc.session);
                     self.collab = Some(link);
                     self.collab_rx = None;
