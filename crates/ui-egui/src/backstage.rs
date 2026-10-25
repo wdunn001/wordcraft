@@ -599,11 +599,6 @@ fn open_recent(app: &mut WordApp, path: &str) -> Result<(), String> {
 
 fn open_page(app: &mut WordApp, ui: &mut Ui) {
     heading(ui, "Open");
-    if ui.button(egui::RichText::new(tl!("Browse…")).font(medium(14.0))).clicked() {
-        let _ = app.run("ui.openFileDialog", json!({}));
-    }
-    // Linux and the BSDs (#576): the system dialog needs a file chooser portal or zenity; when it
-    // doesn't show up, WordCraft's own browser is always one click away.
     #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
     if ui
         .button(egui::RichText::new(tl!("Browse in WordCraft…")).font(medium(14.0)))
@@ -612,14 +607,7 @@ fn open_page(app: &mut WordApp, ui: &mut Ui) {
     {
         let _ = app.run("ui.fileBrowser", json!({}));
     }
-    // Cloud storage sits beside the local picker and never in place of it.
-    if cloud::available(app) {
-        ui.add_space(22.0);
-        section(ui, "Cloud");
-        cloud::open_page(app, ui);
-    }
-    ui.add_space(18.0);
-    open_list(app, ui);
+    cloud::open_page(app, ui);
 }
 
 /// Save As: Browse… asks where to save. It has no recent-documents list: clicking one of those
