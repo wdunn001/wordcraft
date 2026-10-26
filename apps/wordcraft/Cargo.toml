@@ -21,15 +21,15 @@ wordcraft-ui-egui = { workspace = true }
 wordcraft-control-key = { workspace = true }
 # Shared editing. Pinned by revision, as craft-print already is. The relay protocol lives there,
 # so every Craft app speaks the same wire format.
-craft-collab = { git = "https://github.com/wdunn001/collab-craft", rev = "4a49dc5", features = ["native-hub"] }
+craft-collab = {git = "https://github.com/wdunn001/collab-craft", branch = "quasarke", features = ["native-hub"]}
 # How this app reaches CollabCraft. No provider credential, no provider URL and no provider
 # protocol live in here.
-craft-cloud-client = { git = "https://github.com/wdunn001/collab-craft", rev = "3c77c3e" }
+craft-cloud-client = {git = "https://github.com/wdunn001/collab-craft", branch = "quasarke"}
 # The share dialog's and the cloud pages' backend. Both are drawn by wordcraft-ui-egui, which
 # opens no socket; this is the half that reaches CollabCraft, and it lives here because the
 # session this application collects lives here too.
-craft-ui = { git = "https://github.com/wdunn001/craft-libs", rev = "6f0a6d2", features = ["cloud"] }
-collabcraft-share = { git = "https://github.com/wdunn001/collab-craft", rev = "3c77c3e" }
+craft-ui = {git = "https://github.com/wdunn001/craft-libs", branch = "quasarke", features = ["cloud"]}
+collabcraft-share = {git = "https://github.com/wdunn001/collab-craft", branch = "quasarke"}
 # Only the relay client is async, and NativeHub needs a runtime to live on.
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11", "links"] }
@@ -87,7 +87,7 @@ windows = { version = "0.62", features = ["UI_ViewManagement", "System_UserProfi
 clipboard-win = { version = "5.4", features = ["std"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-craft-print = { git = "https://github.com/storytold/craft-libs", rev = "d27646a5f7c8b4fc85d9dd3213b8c88b58e0088d" }
+craft-print = {git = "https://github.com/wdunn001/craft-libs", branch = "quasarke"}
 rfd = { workspace = true }
 # Waits for an `rfd::AsyncFileDialog` on a background thread (the dialogs don't block the UI, #94);
 # rfd itself already depends on it.
