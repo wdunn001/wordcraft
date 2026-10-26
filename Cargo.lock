@@ -1042,14 +1042,16 @@ dependencies = [
 [[package]]
 name = "craft-collab"
 version = "0.1.0"
-source = "git+https://github.com/wdunn001/collab-craft?rev=0d4562e#0d4562eabac15d813a67fcf8aa8498c5716450d6"
 dependencies = [
+ "craft-crdt",
+ "js-sys",
  "log",
  "rust_socketio",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1068,7 +1070,6 @@ dependencies = [
 [[package]]
 name = "craft-crdt"
 version = "0.1.0"
-source = "git+https://github.com/wdunn001/craft-libs?rev=e4ec16beadedc2b9bdd8656aece9f7ad981604f1#e4ec16beadedc2b9bdd8656aece9f7ad981604f1"
 dependencies = [
  "postcard",
  "serde",
@@ -6148,8 +6149,7 @@ dependencies = [
  "clipboard-win",
  "collabcraft-share",
  "craft-cloud-client",
- "craft-collab 0.1.0 (git+https://github.com/wdunn001/collab-craft?rev=0d4562e)",
- "craft-crdt",
+ "craft-collab 0.1.0",
  "craft-print",
  "craft-ui",
  "dispatch2",
@@ -6437,6 +6437,8 @@ version = "0.10.0"
 dependencies = [
  "collabcraft-share",
  "craft-cloud-client",
+ "craft-collab 0.1.0",
+ "craft-ui",
  "eframe",
  "egui",
  "js-sys",
