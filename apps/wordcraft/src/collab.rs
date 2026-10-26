@@ -1,14 +1,16 @@
-//! Shared editing for WordCraft, over the CraftCollab relay.
-//!
-//! The merge and the socket live in [`craft_collab`]. This file is the WordCraft mapping:
-//! paragraphs as scopes, `text.insert` as lock-free CRDT, everything else still locked.
-//! Desktop uses [`craft_collab::native::NativeHub`]; the browser crate includes this file
-//! and uses [`craft_collab::web::WebHub`].
+// Shared editing for WordCraft, over the CraftCollab relay.
+//
+// The merge and the socket live in craft_collab. This file is the WordCraft mapping:
+// paragraphs as scopes, text.insert as lock-free CRDT, everything else still locked.
+// Desktop uses NativeHub; the browser crate includes this file and uses WebHub.
+// Written as ordinary comments so include! from wordcraft-web is valid.
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use craft_collab::{Live, Work, doc_from_token};
+use craft_collab::{Live, Work};
+#[cfg(not(target_arch = "wasm32"))]
+use craft_collab::doc_from_token;
 use serde_json::Value as Json;
 use wordcraft_engine::doc::{Pos, StoryRef};
 use wordcraft_engine::{CollabSink, Selection, Session as Engine};

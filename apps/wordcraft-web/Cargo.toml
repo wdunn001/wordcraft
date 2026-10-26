@@ -21,7 +21,7 @@ log = { workspace = true }
 serde_json = { workspace = true }
 wordcraft-doc = { workspace = true }
 wordcraft-fonts = { workspace = true }
-craft-cloud-client = { git = "https://github.com/wdunn001/collab-craft", rev = "3c77c3e" }
+craft-cloud-client = { git = "https://github.com/wdunn001/collab-craft", rev = "4a49dc5" }
 collabcraft-share = { git = "https://github.com/wdunn001/collab-craft", rev = "3c77c3e" }
 craft-collab = { git = "https://github.com/wdunn001/collab-craft", rev = "4a49dc5", features = ["web-hub"] }
 craft-ui = { git = "https://github.com/wdunn001/craft-libs", rev = "6f0a6d2", features = ["cloud"] }
