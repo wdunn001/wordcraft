@@ -92,10 +92,8 @@ pub fn start() {
                     if invite.is_none() && !sample {
                         app.start_screen();
                     }
-                    if let Some(invitation) = invite.take() {
-                        open_invite(&mut app, invitation);
-                    }
-                    Ok(Box::new(WebShell { app, inbox, messages, prefs }))
+                    let collab = invite.take().and_then(|invitation| open_invite(&mut app, invitation));
+                    Ok(Box::new(WebShell { app, inbox, messages, prefs, collab }))
                 }),
             )
             .await;
@@ -108,21 +106,33 @@ pub fn start() {
     });
 }
 
-fn open_invite(app: &mut WordApp, invitation: craft_cloud_client::invite::Invitation) {
+fn open_invite(app: &mut WordApp, invitation: craft_cloud_client::invite::Invitation) -> Option<crate::collab::Link> {
     let name = invitation.name.clone();
     match wordcraft_ui_egui::cloud::CloudApp::open_bytes(app, &name, invitation.document.clone()) {
         Ok(Some(_)) => {
             let mode = if invitation.read_only() { " (view only)" } else { "" };
             let who = if invitation.recipient.is_empty() { String::new() } else { format!(" (shared with {})", invitation.recipient) };
             app.status(format!("Opened \"{name}\"{mode}{who}"));
-            if let Err(e) = invitation.join() {
-                log::warn!("invite relay join failed: {e}");
+            match invitation.join() {
+                Ok(hub) => {
+                    let mut link = crate::collab::Link::from_web(hub, invitation.room());
+                    link.bind(&mut app.session);
+                    Some(link)
+                }
+                Err(e) => {
+                    log::warn!("invite relay join failed: {e}");
+                    None
+                }
             }
         }
-        Ok(None) => app.status(format!("Shared \"{name}\" needs a choice before it opens")),
+        Ok(None) => {
+            app.status(format!("Shared \"{name}\" needs a choice before it opens"));
+            None
+        }
         Err(e) => {
             log::error!("invite open failed: {e}");
             craft_cloud_client::invite::refuse(&format!("The shared document could not be opened. {e}"));
+            None
         }
     }
 }
@@ -138,6 +148,7 @@ struct WebShell {
     inbox: Inbox,
     messages: Rc<RefCell<Vec<String>>>,
     prefs: crate::prefs::PrefsSync,
+    collab: Option<crate::collab::Link>,
 }
 
 fn local_storage() -> Option<web_sys::Storage> {
@@ -169,6 +180,14 @@ impl eframe::App for WebShell {
         let msgs = std::mem::take(&mut *self.messages.borrow_mut());
         for msg in msgs {
             self.app.status(msg);
+        }
+        if let Some(link) = &mut self.collab {
+            link.pump(&mut self.app.session);
+            self.app.presence.set(link.roster.iter().map(|(id, display)| craft_ui::presence::Peer::new(id.clone(), display.clone())).collect());
+            for notice in std::mem::take(&mut link.notices) {
+                self.app.status(notice);
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(120));
         }
         self.app.logic(ctx);
         // Store changed preferences straight away: a reload or closed tab runs no exit code (#2132).

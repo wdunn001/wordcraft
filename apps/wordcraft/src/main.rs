@@ -16,7 +16,6 @@ mod clipboard;
 mod cloud;
 mod collab;
 mod control_server;
-mod crdt;
 mod default_apps;
 mod file_dialogs;
 #[cfg(any(target_os = "windows", target_os = "macos", test))]
