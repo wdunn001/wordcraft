@@ -59,7 +59,7 @@ impl eframe::App for App {
         apple_events::poll(&self.events, &mut self.doc, ctx);
         if self.collab.is_none() {
             match self.collab_rx.as_ref().map(std::sync::mpsc::Receiver::try_recv) {
-                Some(Ok(link)) => {
+                Some(Ok(mut link)) => {
                     link.bind(&mut self.doc.session);
                     self.collab = Some(link);
                     self.collab_rx = None;

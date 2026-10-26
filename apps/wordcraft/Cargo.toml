@@ -21,7 +21,7 @@ wordcraft-ui-egui = { workspace = true }
 wordcraft-control-key = { workspace = true }
 # Shared editing. Pinned by revision, as craft-print already is. The relay protocol lives there,
 # so every Craft app speaks the same wire format.
-craft-collab = { git = "https://github.com/wdunn001/collab-craft", rev = "3c77c3e", features = ["native-hub"] }
+craft-collab = { git = "https://github.com/wdunn001/collab-craft", rev = "4a49dc5", features = ["native-hub"] }
 # How this app reaches CollabCraft. No provider credential, no provider URL and no provider
 # protocol live in here.
 craft-cloud-client = { git = "https://github.com/wdunn001/collab-craft", rev = "3c77c3e" }
@@ -34,6 +34,7 @@ collabcraft-share = { git = "https://github.com/wdunn001/collab-craft", rev = "3
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "wayland", "x11", "links"] }
 egui = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
 chrono = { workspace = true }

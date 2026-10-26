@@ -1,27 +1,24 @@
-//! Shared editing for WordCraft, over the CraftCollab relay.
-//!
-//! Three contracts keep this from hardcoding a vendor. The engine hands us a local command through
-//! [`wordcraft_engine::CollabSink`] without knowing we exist. The transport is
-//! [`craft_collab::Hub`]. A credential arrives through [`TokenSource`]. Each has one
-//! implementation here, and another deployment can supply its own without touching the engine or
-//! the UI.
-//!
-//! The relay never holds a document. It assigns a strictly increasing sequence to every edit and
-//! fans it out, and each peer applies edits in that order.
-//!
-//! A word processor needs one thing a spreadsheet does not. `cell.set` carries its own address, so
-//! it means the same thing wherever it lands. `text.insert` and `edit.delete` mean "here", and
-//! here is wherever the caret is. So the sender's selection travels with the command, under a key
-//! of our own in its parameters, and the receiver runs the command against that selection. Without
-//! it every remote keystroke would land at the reader's caret and scramble their own paragraph.
+// Shared editing for WordCraft, over the CraftCollab relay.
+//
+// The merge and the socket live in craft_collab. This file is the WordCraft mapping:
+// paragraphs as scopes, text.insert as lock-free CRDT, everything else still locked.
+// Desktop uses NativeHub; the browser crate includes this file and uses WebHub.
+// Written as ordinary comments so include! from wordcraft-web is valid.
 
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use craft_collab::native::NativeHub;
-use craft_collab::{Effect, Hub, ServerMsg, Session as Wire};
+use craft_collab::{Live, Work};
+#[cfg(not(target_arch = "wasm32"))]
+use craft_collab::doc_from_token;
 use serde_json::Value as Json;
+use wordcraft_engine::doc::{Pos, StoryRef};
 use wordcraft_engine::{CollabSink, Selection, Session as Engine};
+
+#[cfg(not(target_arch = "wasm32"))]
+use craft_collab::native::NativeHub;
+#[cfg(target_arch = "wasm32")]
+use craft_collab::web::WebHub;
 
 /// The key the sender's selection travels under.
 ///
@@ -37,28 +34,18 @@ const AT: &str = "$collabAt";
 /// forge any file id and any permission bits, and that is why the key stays server-side.
 pub trait TokenSource: Send {
     /// Where the relay is, and a signed token for one document.
-    ///
-    /// One call, because one call mints one token. Asking separately would reach the service twice
-    /// and burn a token on the first answer. They belong together anyway: the service authorises
-    /// the open and signs the result in the same step, and it is the service that knows which
-    /// relay to use.
-    ///
-    /// The roster name is not asked for. The relay takes it from the token's own claim, so a
-    /// client cannot present itself as somebody else.
     fn join(&self) -> Option<(String, String)>;
 }
 
 /// Reads the environment.
-///
-/// This is the testing path and the one `craft-collab`'s `join` example uses, so a token minted
-/// against the live service works here unchanged. A desktop login flow is a second implementation
-/// of the same trait (`cloud::CloudToken`).
 pub struct EnvToken;
 
+#[cfg(not(target_arch = "wasm32"))]
 fn env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.trim().is_empty())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl TokenSource for EnvToken {
     fn join(&self) -> Option<(String, String)> {
         Some((env("COLLABCRAFT_RELAY")?, env("COLLABCRAFT_TOKEN")?))
@@ -74,9 +61,6 @@ struct Edit {
 }
 
 /// The engine-facing half, held by the engine as an `Arc<dyn CollabSink>`.
-///
-/// It only forwards onto a channel. Doing network work here would run it inside the command that
-/// triggered it and stall a frame.
 struct Outbound(Sender<Edit>);
 
 impl CollabSink for Outbound {
@@ -86,92 +70,37 @@ impl CollabSink for Outbound {
             (Some(object), Ok(at)) => {
                 object.insert(AT.to_owned(), at);
             }
-            // Parameters that are not an object have nowhere to carry a position. The command then
-            // lands at the reader's own caret, which is the best a peer can do with it.
             _ => log::debug!("collab: {id} carries no position"),
         }
-        // A closed channel means the link was dropped, which is not an error.
         let _ = self.0.send(Edit { id: id.to_owned(), params, scope: scope.to_owned() });
     }
 }
 
 /// Pull the sender's selection back out of a command's parameters.
-///
-/// The command is then exactly the one the sender ran, which is what goes into the undo history on
-/// both sides.
 fn take_position(mut params: Json) -> (Json, Option<Selection>) {
     let at = params.as_object_mut().and_then(|object| object.remove(AT)).and_then(|at| serde_json::from_value(at).ok());
     (params, at)
 }
 
-/// The room name the relay uses, read out of the token.
-///
-/// The relay keys a room on the provider's file id and never on a path, so a rename or a move
-/// mid-session does not split the peers. `craft_collab::Session` drops any message whose doc does
-/// not match its own, so getting this wrong looks exactly like a relay that answers nothing.
-///
-/// The token is `base64url(payload).signature`. Reading the payload needs no key and proves
-/// nothing. It is parsed here only to learn the file id, and the relay still verifies the
-/// signature before honouring anything.
-fn doc_from_token(token: &str) -> Option<String> {
-    let payload = token.split('.').next()?;
-    let json = base64url(payload)?;
-    let v: Json = serde_json::from_slice(&json).ok()?;
-    let fid = v.get("fid")?.as_u64()?;
-    Some(format!("doc:{fid}"))
-}
-
-/// Decodes unpadded base64url, hand-rolled to avoid a dependency for one call.
-fn base64url(s: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
-    let mut acc: u32 = 0;
-    let mut bits: u32 = 0;
-    for b in s.bytes() {
-        let six: u8 = match b {
-            b'A'..=b'Z' => b - b'A',
-            b'a'..=b'z' => b - b'a' + 26,
-            b'0'..=b'9' => b - b'0' + 52,
-            b'-' => 62,
-            b'_' => 63,
-            b'=' => continue,
-            _ => return None,
-        };
-        acc = (acc << 6) | u32::from(six);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
-    }
-    Some(out)
-}
-
 /// A live shared-editing link.
 pub struct Link {
-    // Declared before the runtime so the hub is dropped first. The socket runs on a task inside
-    // the runtime; dropping the runtime first would close the connection underneath the hub.
-    hub: NativeHub,
+    #[cfg(not(target_arch = "wasm32"))]
+    live: Live<NativeHub>,
+    #[cfg(not(target_arch = "wasm32"))]
     _rt: tokio::runtime::Runtime,
-    wire: Wire,
+    #[cfg(target_arch = "wasm32")]
+    live: Live<WebHub>,
     local: Receiver<Edit>,
     outbound: Sender<Edit>,
     /// Lines for the user, drained by the app each frame.
     pub notices: Vec<String>,
-    /// Who else is in the document. The identifier comes with the name because a badge's colour is
-    /// derived from it, and a remote caret drawn elsewhere has to arrive at the same colour.
+    /// Who else is in the document.
     pub roster: Vec<(String, String)>,
-    /// The last connection state reported, so a change is announced once rather than on every
-    /// frame.
-    was_connected: bool,
 }
 
 impl Link {
     /// Reaches the relay on a worker. The first paint does not wait.
-    ///
-    /// The receiver yields one [`Link`] when the handshake succeeds. It disconnects with nothing
-    /// sent when no credential is configured or the relay cannot be reached, and the app then
-    /// behaves exactly as it did before. Shared editing is an addition, never a precondition for
-    /// opening a file.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn spawn(src: impl TokenSource + 'static) -> Receiver<Link> {
         let (tx, rx) = channel();
         let _ = std::thread::Builder::new().name("collab-connect".into()).spawn(move || {
@@ -182,8 +111,7 @@ impl Link {
         rx
     }
 
-    /// Connects to the relay. Does not touch the engine; call [`Link::bind`] on the UI thread once
-    /// the window exists.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn connect(src: &dyn TokenSource) -> Option<Link> {
         let (relay, token) = src.join()?;
         let Some(doc) = doc_from_token(&token) else {
@@ -211,113 +139,107 @@ impl Link {
             }
         };
 
-        // Nothing is sent here on purpose. The relay admits a peer from the token in the handshake
-        // and has no handler for a client-sent join. Sending one raced the namespace registration,
-        // lost, and cost a duplicate session every time. The relay speaks first.
-        let wire = Wire::new(doc.clone());
-
         let (outbound, local) = channel();
         log::info!("collab: joining {doc} on {relay}");
-        Some(Link { hub, _rt: rt, wire, local, outbound, notices: Vec::new(), roster: Vec::new(), was_connected: true })
+        Some(Link {
+            live: Live::new(hub, doc),
+            _rt: rt,
+            local,
+            outbound,
+            notices: Vec::new(),
+            roster: Vec::new(),
+        })
+    }
+
+    /// A browser invite already opened the socket. Hold this for as long as the document is open.
+    #[cfg(target_arch = "wasm32")]
+    pub fn from_web(hub: WebHub, room: &str) -> Link {
+        let (outbound, local) = channel();
+        log::info!("collab: joining {room} from the browser");
+        Link {
+            live: Live::new(hub, room),
+            local,
+            outbound,
+            notices: Vec::new(),
+            roster: Vec::new(),
+        }
     }
 
     /// Hands the engine the outbound sink.
-    ///
-    /// Call once, on the UI thread, after the window exists. Edits made before this returns stay
-    /// local.
-    pub fn bind(&self, engine: &mut Engine) {
+    pub fn bind(&mut self, engine: &mut Engine) {
+        self.seed_from(engine);
         engine.collab = Some(Arc::new(Outbound(self.outbound.clone())));
     }
 
-    /// One frame's work: send what the user did, apply what arrived.
-    ///
-    /// Called from the app's per-frame hook. Everything here is a channel operation, so no IO
-    /// happens on the UI thread.
-    pub fn pump(&mut self, engine: &mut Engine) {
-        // Say so when the link drops, and again when it comes back. An edit made while
-        // disconnected still applies locally and is still queued, so the user needs to know it has
-        // not reached anyone yet.
-        let now = self.hub.connected();
-        if now != self.was_connected {
-            self.notices.push(if now {
-                "reconnected to the other editors".to_owned()
-            } else {
-                "not connected to the other editors; your edits are waiting".to_owned()
-            });
-            self.was_connected = now;
-        }
-
-        // Outbound next, so a local edit is on its way before time goes on applying remote ones.
-        while let Ok(edit) = self.local.try_recv() {
-            let msg = self.wire.submit(edit.id, edit.params, Some(edit.scope));
-            if let Err(e) = self.hub.send(msg) {
-                self.notices.push(format!("that edit did not reach the others: {e}"));
-            }
-        }
-
-        for msg in self.hub.poll() {
-            // The relay names the room, and a session discards every message whose doc does not
-            // match its own. The token gave us a starting guess so the first frame could already
-            // submit. The relay's own answer replaces it, so a change in how rooms are named on
-            // that side cannot silently mute this client.
-            if matches!(msg, ServerMsg::Joined { .. }) {
-                let named = msg.doc().to_owned();
-                if named != self.wire.doc() {
-                    log::info!("collab: the relay named the room {named}");
-                    self.wire = Wire::new(named);
-                }
-            }
-            let effects = self.wire.handle(msg);
-            for effect in effects {
-                self.act(engine, effect);
+    fn seed_from(&mut self, engine: &Engine) {
+        for path in engine.doc.para_paths(StoryRef::Body) {
+            if let Some(para) = engine.doc.para(StoryRef::Body, &path) {
+                let at = Pos { story: StoryRef::Body, path, off: 0 };
+                self.live.texts().seed(&wordcraft_engine::collab::scope_of(&at), &para.text);
             }
         }
     }
 
-    fn act(&mut self, engine: &mut Engine, effect: Effect) {
-        match effect {
-            // The whole point. Applied through `apply_remote`, which runs it against the sender's
-            // selection and does not hand it straight back as a local edit.
-            Effect::Apply { command, params } => {
-                let (params, at) = take_position(params);
-                if let Err(e) = engine.apply_remote(&command, &params, at) {
-                    log::warn!("collab: a remote {command} did not apply: {e}");
-                    self.notices.push(format!("could not apply a change from another editor: {e}"));
+    /// One frame's work: send what the user did, apply what arrived.
+    pub fn pump(&mut self, engine: &mut Engine) {
+        while let Ok(edit) = self.local.try_recv() {
+            if edit.id == "text.insert" {
+                if let Err(e) = self.send_insert(&edit, engine) {
+                    self.live.notices.push(format!("that edit did not reach the others: {e}"));
                 }
+                continue;
             }
-            Effect::Confirmed { .. } => {}
-            Effect::Replace { document, seq } => {
-                // The relay holds no documents yet, so this carries null and there is nothing to
-                // install. Logged rather than dropped, because a non-null one means the relay grew
-                // a snapshot store and this arm needs writing. Whoever writes it should know that
-                // `Session::set_document` starts a new document, which leaves the cloud origin
-                // keyed on the one that went away.
-                if document.is_null() {
-                    log::debug!("collab: resynced to seq {seq} with no snapshot");
-                } else {
-                    log::warn!("collab: a snapshot arrived at seq {seq} and WordCraft cannot install one yet");
+            if let Err(e) = self.live.submit(edit.id, edit.params, Some(edit.scope)) {
+                self.live.notices.push(format!("that edit did not reach the others: {e}"));
+            }
+        }
+
+        for work in self.live.pump() {
+            match work {
+                Work::Text { scope, rendered } => {
+                    if let Err(e) = engine.apply_crdt_paragraph(&scope, &rendered) {
+                        log::warn!("collab: a remote crdt.text did not apply: {e}");
+                        self.live.notices.push(format!("could not apply a change from another editor: {e}"));
+                    }
                 }
-            }
-            Effect::LockHeld { .. } | Effect::LockDropped { .. } | Effect::RemoteLocks { .. } => {}
-            Effect::LockRefused { scope, holder } => {
-                self.notices.push(format!("{holder} is editing {scope}"));
-            }
-            Effect::Roster { roster } => {
-                // Everybody is in this list, the reader included. A row showing who else is here
-                // has to drop itself.
-                let me = self.wire.me().cloned();
-                self.roster = roster.into_iter().filter(|p| Some(&p.peer) != me.as_ref()).map(|p| (p.peer.to_string(), p.display)).collect();
-            }
-            Effect::Notice { detail } => {
-                log::info!("collab: {detail}");
-                self.notices.push(detail);
-            }
-            // The session asks for its own resyncs this way.
-            Effect::Send { msg } => {
-                if let Err(e) = self.hub.send(msg) {
-                    log::warn!("collab: a resync request never left: {e}");
+                Work::Command { command, params } => {
+                    let (params, at) = take_position(params);
+                    if let Err(e) = engine.apply_remote(&command, &params, at) {
+                        log::warn!("collab: a remote {command} did not apply: {e}");
+                        self.live.notices.push(format!("could not apply a change from another editor: {e}"));
+                    }
                 }
             }
         }
+        self.notices = std::mem::take(&mut self.live.notices);
+        self.roster.clone_from(&self.live.roster);
+    }
+
+    fn send_insert(&mut self, edit: &Edit, engine: &Engine) -> craft_collab::Result<()> {
+        let inserted = match edit.params.get("text").and_then(Json::as_str) {
+            Some(s) if !s.is_empty() => s,
+            _ => return self.live.submit(edit.id.clone(), edit.params.clone(), Some(edit.scope.clone())),
+        };
+        let at: Selection = match edit.params.get(AT).cloned().and_then(|v| serde_json::from_value(v).ok()) {
+            Some(at) => at,
+            None => return self.live.submit(edit.id.clone(), edit.params.clone(), Some(edit.scope.clone())),
+        };
+        let Some(pos) = wordcraft_engine::collab::parse_scope(&edit.scope) else {
+            return self.live.submit(edit.id.clone(), edit.params.clone(), Some(edit.scope.clone()));
+        };
+        let Some(para) = engine.doc.para_at(&pos) else {
+            return self.live.submit(edit.id.clone(), edit.params.clone(), Some(edit.scope.clone()));
+        };
+        if self.live.texts().render(&edit.scope).is_none() {
+            let prefix = para.text.get(..at.focus.off.min(para.text.len())).unwrap_or("");
+            let start = at.focus.off.saturating_add(inserted.len());
+            let suffix = para.text.get(start..).unwrap_or("");
+            let mut before = String::with_capacity(prefix.len() + suffix.len());
+            before.push_str(prefix);
+            before.push_str(suffix);
+            self.live.texts().seed(&edit.scope, &before);
+        }
+        let prefix = para.text.get(..at.focus.off.min(para.text.len())).unwrap_or("");
+        self.live.insert_text(&edit.scope, prefix.chars().count(), inserted)
     }
 }

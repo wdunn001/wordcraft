@@ -386,6 +386,21 @@ impl CloudApp for WordApp {
         Some(self.tr("A name with no extension is saved as a Word document (.docx) in the folder above."))
     }
 
+    fn recents(&self) -> Vec<String> {
+        self.ui.recent.clone()
+    }
+
+    fn open_recent(&mut self, path: &str) {
+        if self.run("file.open", json!({"path": path})).is_ok() {
+            self.ui.backstage = false;
+            self.canvas.want_focus = true;
+        }
+    }
+
+    fn browse_local(&mut self) {
+        let _ = self.run("ui.openFileDialog", json!({}));
+    }
+
     fn style(&self, ui: &Ui) -> craft_ui::cloud::CloudStyle {
         let t = Tokens::get(ui.ctx());
         craft_ui::cloud::CloudStyle {

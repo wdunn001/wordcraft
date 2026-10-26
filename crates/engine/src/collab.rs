@@ -14,7 +14,7 @@
 //! rather than against the reader's own.
 
 use serde_json::Value as Json;
-use wordcraft_doc::{Pos, StoryRef};
+use wordcraft_doc::{Path, Pos, StoryRef};
 
 use crate::Selection;
 
@@ -59,6 +59,24 @@ pub fn scope_of(at: &Pos) -> String {
         StoryRef::Body => format!("/body/{}", at.path),
         StoryRef::Part(part) => format!("/part/{part}/{}", at.path),
     }
+}
+
+/// The position a [`scope_of`] string names. Offset is always 0: the scope is the paragraph.
+#[must_use]
+pub fn parse_scope(scope: &str) -> Option<Pos> {
+    let rest = scope.strip_prefix('/')?;
+    if let Some(n) = rest.strip_prefix("body/") {
+        let idx: usize = n.parse().ok()?;
+        return Some(Pos::body(idx, 0));
+    }
+    let rest = rest.strip_prefix("part/")?;
+    let mut bits = rest.split('/');
+    let part: u32 = bits.next()?.parse().ok()?;
+    let path: Vec<u32> = bits.map(|s| s.parse().ok()).collect::<Option<_>>()?;
+    if path.is_empty() {
+        return None;
+    }
+    Some(Pos { story: StoryRef::Part(part), path: Path(path), off: 0 })
 }
 
 /// Where a position belongs after an edit of `grew` characters at `edit`.
@@ -212,5 +230,29 @@ mod tests {
     fn a_scope_names_the_story_and_the_paragraph() {
         assert_eq!(scope_of(&Pos::body(3, 0)), "/body/3");
         assert_eq!(scope_of(&Pos::new(StoryRef::Part(2), wordcraft_doc::Path(vec![1, 0, 1, 4]), 7)), "/part/2/1/0/1/4");
+    }
+
+    #[test]
+    fn parse_scope_roundtrips() {
+        let body = Pos::body(3, 7);
+        let named = parse_scope(&scope_of(&body)).expect("body");
+        assert_eq!(named.story, StoryRef::Body);
+        assert_eq!(named.path, body.path);
+        assert_eq!(named.off, 0);
+
+        let part = Pos::new(StoryRef::Part(2), wordcraft_doc::Path(vec![1, 0, 1, 4]), 7);
+        let named = parse_scope(&scope_of(&part)).expect("part");
+        assert_eq!(named.story, StoryRef::Part(2));
+        assert_eq!(named.path, part.path);
+    }
+
+    #[test]
+    fn a_crdt_paragraph_write_is_not_echoed() {
+        let (mut session, heard) = two_paragraphs();
+        session.sel = Selection::caret(Pos::body(1, 0));
+        session.apply_crdt_paragraph("/body/0", "Hello there world").unwrap();
+        assert_eq!(text(&session), "Hello there world\nSecond");
+        assert!(heard.0.lock().unwrap().is_empty(), "a CRDT write is remote and must not echo");
+        assert_eq!(session.sel.focus, Pos::body(1, 0), "an edit in another paragraph leaves the reader's caret alone");
     }
 }
