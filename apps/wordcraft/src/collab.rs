@@ -209,6 +209,32 @@ impl Link {
                         self.live.notices.push(format!("could not apply a change from another editor: {e}"));
                     }
                 }
+                // Operations arrived for a paragraph this replica has not loaded: seed it from
+                // the document, and show the merged text the held operations produced.
+                Work::SeedWanted { scope } => {
+                    let text = wordcraft_engine::collab::parse_scope(&scope).and_then(|at| engine.doc.para_at(&at).map(|p| p.text.clone()));
+                    match text {
+                        Some(text) => {
+                            let rendered = self.live.seed(&scope, &text);
+                            if rendered != text
+                                && let Err(e) = engine.apply_crdt_paragraph(&scope, &rendered)
+                            {
+                                log::warn!("collab: a seeded crdt.text did not apply: {e}");
+                                self.live.notices.push(format!("could not apply a change from another editor: {e}"));
+                            }
+                        }
+                        None => log::warn!("collab: a peer sent text for unknown paragraph {scope}"),
+                    }
+                }
+                // The relay dropped operations this replica needs; the text cannot be rebuilt.
+                Work::TextIncomplete { scope } => {
+                    log::warn!("collab: {scope} cannot be rebuilt from the relay");
+                    self.live.notices.push("some shared changes were lost; reopen the document to catch up".to_owned());
+                }
+                // WordCraft sends no app frames, so one from a peer is another app's business.
+                Work::Frame { origin, .. } => log::debug!("collab: ignoring an app frame from {origin}"),
+                // Remote carets and selections are not drawn yet.
+                Work::Ephemeral { .. } => {}
             }
         }
         self.notices = std::mem::take(&mut self.live.notices);

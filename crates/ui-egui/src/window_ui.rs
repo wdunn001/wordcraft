@@ -162,6 +162,15 @@ impl WordApp {
             // App-wide.
             session: _,
             services: _,
+            // Cloud storage, sharing and presence: one account and one set of transfers for the
+            // whole app, not per window.
+            cloud: _,
+            cloud_sent: _,
+            cloud_opening: _,
+            cloud_open_entry: _,
+            share: _,
+            share_save_for: _,
+            presence: _,
             printing: _,
             print_feedback_seen: _,
             font_generation: _,
@@ -268,6 +277,8 @@ impl WordApp {
             date_time_language: _,
             date_time_update: _,
             recent_colors: _,
+            // A choice about one save: it follows the user, not a window.
+            save_to_cloud: _,
             recent_fonts: _,
             theme: _,
             interface_size: _,

@@ -110,6 +110,15 @@ impl Worker {
                 });
                 self.post(Event::Account(answer));
             }
+            // Its own job so Account can stay read-only on a cold start: this one may block
+            // through the device flow until the user finishes in their browser.
+            Job::SignIn => {
+                let answer = self.call(|client| client.me()).map(|me| {
+                    remember_account(&me.id, &me.display);
+                    Account { display: me.display, capabilities: me.capabilities, provider_linked: me.provider_linked }
+                });
+                self.post(Event::Account(answer));
+            }
             Job::LinkStart => match self.call(|client| client.link_start()) {
                 Ok(start) => match https_browser_url(&start.login_url) {
                     Some(url) => self.post(Event::Browser { url, handle: Some(start.handle) }),

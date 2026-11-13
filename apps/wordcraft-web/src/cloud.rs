@@ -49,6 +49,18 @@ impl Service {
                 }
                 post(Event::Account(answer));
             }
+            Job::SignIn => {
+                // The browser build signs in by navigating to the service's login page; the page
+                // comes back signed in, and the fresh page asks for the account itself. Already
+                // signed in, the answer unsticks the working badge.
+                match self.me().await {
+                    Ok(me) => {
+                        post(Event::Account(Ok(Account { display: me.display, capabilities: me.capabilities, provider_linked: me.provider_linked })))
+                    }
+                    Err(Fault::Unauthenticated) => offer_login(),
+                    Err(fault) => post(Event::Account(Err(fault))),
+                }
+            }
             Job::LinkStart => match self.client.link_start().await.map_err(fault) {
                 Ok(start) => post(Event::Browser { url: start.login_url, handle: Some(start.handle) }),
                 Err(fault) => post(Event::Linked(Err(fault))),

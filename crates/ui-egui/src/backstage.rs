@@ -1,6 +1,6 @@
 //! File tab (Backstage): Home/New, Open, Info, Save As, Print, Export, Close, Options, About.
 
-use egui::{Rect, Sense, Stroke, Ui, pos2, vec2};
+use egui::{Align2, Rect, Sense, Stroke, Ui, pos2, vec2};
 use serde_json::json;
 
 use crate::theme::{Tokens, medium, regular, semibold};
@@ -756,6 +756,11 @@ pub(crate) fn open_recent(app: &mut WordApp, path: &str) -> Result<(), String> {
 
 fn open_page(app: &mut WordApp, ui: &mut Ui) {
     heading(ui, "Open");
+    if ui.button(egui::RichText::new(tl!("Browse…")).font(medium(14.0))).clicked() {
+        let _ = app.run("ui.openFileDialog", json!({}));
+    }
+    // Linux and the BSDs (#576): the system dialog needs a file chooser portal or zenity; when it
+    // doesn't show up, WordCraft's own browser is always one click away.
     #[cfg(all(unix, not(target_os = "macos"), not(target_arch = "wasm32")))]
     if ui
         .button(egui::RichText::new(tl!("Browse in WordCraft…")).font(medium(14.0)))
@@ -764,6 +769,9 @@ fn open_page(app: &mut WordApp, ui: &mut Ui) {
     {
         let _ = app.run("ui.fileBrowser", json!({}));
     }
+    ui.add_space(18.0);
+    open_list(app, ui);
+    ui.add_space(18.0);
     cloud::open_page(app, ui);
 }
 
