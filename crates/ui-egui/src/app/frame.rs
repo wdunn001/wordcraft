@@ -1,0 +1,235 @@
+#[cfg(not(target_arch = "wasm32"))]
+use super::file_browser;
+use super::{
+    WordApp, backstage, canvas, chrome, colors, content_controls, dialogs, documents, keys, now_ms, panes, read_aloud, ribbon, theme, updates_ui,
+    zotero,
+};
+
+use crate::i18n;
+
+/// How long the status bar shows a message, in milliseconds.
+pub(crate) const STATUS_MS: f64 = 6000.0;
+
+/// Carry out a save the share dialog asked for, and report the outcome back.
+///
+/// Split into asking and answering because the save travels. The dialog waits, showing its own
+/// progress, until one of these arrives.
+fn share_save(app: &mut WordApp) {
+    if let Some(request) = app.share.take_save_request() {
+        // One destination today. `request.destination` names which, and is carried through so a
+        // second provider needs no change here.
+        let _ = request.destination;
+        // Comment text still being typed is written first. This call does not go through
+        // `WordApp::run`, so the flush list on save commands does not cover it.
+        let _ = panes::flush_comment_drafts(app);
+        // The name the copy is saved under is also the format it is written in (see
+        // `cloud::target_name`), so the pages hold it while the bytes are made.
+        app.cloud.save_name = request.name.clone();
+        let uid = app.session.document_id();
+        let previous = app.cloud.origins.get(&uid).map(|origin| origin.entry.id.clone());
+        match crate::cloud::save_as(app, "/", &request.name) {
+            Ok(_) => {
+                app.cloud.sharing_save = true;
+                app.share_save_for = Some((uid, previous));
+            }
+            Err(reason) => app.share.save_failed(reason),
+        }
+    }
+
+    // The worker reports by clearing `busy`. Success is a new origin on the document that was
+    // saved, not whatever document is active when this runs.
+    if app.cloud.sharing_save && app.cloud.busy.is_none() {
+        app.cloud.sharing_save = false;
+        let pending = app.share_save_for.take();
+        let landed = pending.as_ref().and_then(|(uid, previous)| {
+            let origin = app.cloud.origins.get(uid)?;
+            (previous.as_deref() != Some(origin.entry.id.as_str())).then_some(origin)
+        });
+        match landed {
+            Some(origin) => {
+                let (id, name) = (origin.entry.id.clone(), origin.entry.name.clone());
+                app.share.saved(id, name);
+            }
+            None => {
+                let reason = app.cloud.status.clone().unwrap_or_else(|| crate::tl!("The document was not saved.").to_owned());
+                app.share.save_failed(reason);
+            }
+        }
+    }
+}
+/// How long [`WordApp::status_long`] shows one: a warning that is easy to miss in six seconds.
+const STATUS_LONG_MS: f64 = 20000.0;
+
+impl WordApp {
+    /// A file that wouldn't open (#1103): log it, and say on the status bar which file and why,
+    /// whatever handed it over (the command line, a macOS open event, a drop). Returns the message.
+    pub fn report_open_failure(&mut self, path: &str, error: &str) -> String {
+        log::warn!("{path}: {error}");
+        let msg = crate::i18n::fmt(crate::tl!("Couldn't open {path}: {error}"), &[("path", &crate::i18n::isolate_path(path)), ("error", error)]);
+        self.status(msg.clone());
+        msg
+    }
+
+    /// Sets a temporary status message in the bottom status bar.
+    pub fn status(&mut self, s: impl Into<String>) {
+        self.status_msg = Some((s.into(), now_ms()));
+    }
+
+    /// A status message that stays [`STATUS_LONG_MS`] instead of the usual six seconds: the bar
+    /// shows a message until six seconds after its time, so its time is set that much later.
+    pub fn status_long(&mut self, s: impl Into<String>) {
+        self.status_msg = Some((s.into(), now_ms() + STATUS_LONG_MS - STATUS_MS));
+    }
+
+    /// Write the current preferences out through the host's hook, if it has one (#2716). The
+    /// desktop app saves them at exit; a change that should survive a crash, like taking a
+    /// document off the recent list, needs a save at the moment of the change. `None`: the host
+    /// has no hook or wrote nothing; `Some(Err)`: the write failed, and the status line says so.
+    pub(super) fn save_prefs_now(&mut self) -> Option<Result<(), String>> {
+        let save = self.services.save_prefs.as_ref()?;
+        match save(self) {
+            Ok(true) => Some(Ok(())),
+            // The host wrote nothing (preferences switched off): same as having no hook.
+            Ok(false) => None,
+            Err(e) => {
+                self.status(i18n::fmt(tl!("Could not save the preferences: {error}"), &[("error", &e)]));
+                Some(Err(e))
+            }
+        }
+    }
+
+    /// Document title for the title bar (and the suggested file name). An untitled document is
+    /// named in the interface language, as `Document1` is in English.
+    pub fn title_stem(&self) -> String {
+        let mut title = match &self.session.path {
+            Some(p) => p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| tl!("Document1").into()),
+            None => match crate::cloud::origin(self) {
+                // A document that came from the cloud is named by its cloud entry.
+                Some(origin) => match origin.entry.name.rsplit_once('.') {
+                    Some((stem, _)) if !stem.is_empty() => stem.to_string(),
+                    _ => origin.entry.name.clone(),
+                },
+                None => match &self.session.file_name {
+                    Some(name) => name.clone(),
+                    None if self.session.doc.core.title.is_empty() => {
+                        documents::untitled_title(&self.session.resolved_filenames().0).unwrap_or_else(|| tl!("Document1").into())
+                    }
+                    None => self.session.doc.core.title.clone(),
+                },
+            },
+        };
+        // X11 converts window titles to C strings, which cannot contain NUL (#3634).
+        title.retain(|c| c != '\0');
+        if title.is_empty() { tl!("Document1").into() } else { title }
+    }
+
+    /// Tell the host whether the document has unsaved changes ([`Services::on_dirty`]).
+    pub(super) fn report_dirty(&self) {
+        if let Some(f) = &self.services.on_dirty {
+            f(self.session.dirty || panes::has_comment_drafts(self));
+        }
+    }
+
+    /// Draw the File page, the empty-window chrome, or the normal document window.
+    pub(super) fn paint_window(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, t: theme::Tokens) {
+        let window = self.windows.shown();
+        let moved = |app: &WordApp| app.windows.shown() != window;
+        if self.ui.backstage {
+            backstage::show(self, ui);
+        } else if !self.has_document() {
+            // No document open (#1129): the ribbon greyed out but for Help, and no page.
+            chrome::title_bar(self, ui);
+            ribbon::show(self, ui);
+            chrome::status_bar(self, ui);
+            egui::CentralPanel::default().frame(egui::Frame::NONE.fill(t.canvas)).show(ui, |_| {});
+        } else {
+            let screen = chrome::Screen::of(&self.session.view);
+            // Focus and Full Screen (#1678) take the whole screen, with only their slim bar.
+            self.focus_ribbon &= screen == chrome::Screen::Focus;
+            if screen != chrome::Screen::Normal {
+                chrome::screen_bar(self, ui, screen);
+            } else {
+                chrome::title_bar(self, ui);
+                if moved(self) {
+                    return;
+                }
+                ribbon::show(self, ui);
+                if moved(self) {
+                    return;
+                }
+                crate::language_packs::bar(self, ui);
+                chrome::status_bar(self, ui);
+                panes::show(self, ui);
+            }
+            if moved(self) {
+                return;
+            }
+            let fill = if screen == chrome::Screen::Focus { chrome::FOCUS_CANVAS } else { t.canvas };
+            egui::CentralPanel::default().frame(egui::Frame::NONE.fill(fill)).show(ui, |ui| {
+                if self.session.md_source.is_some() {
+                    crate::md_source::show(self, ui);
+                } else {
+                    canvas::show(self, ui);
+                }
+            });
+            if self.focus_ribbon && !moved(self) {
+                chrome::focus_ribbon(self, ctx);
+            }
+        }
+    }
+
+    /// Dialogs, panes and other overlays drawn over the window. A command that brings another
+    /// window's state in ends the drawing: the rest would be the other window's.
+    pub(super) fn show_overlays(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let window = self.windows.shown();
+        let moved = |app: &WordApp| app.windows.shown() != window;
+        content_controls::popup(self, ctx);
+        // Unconditional, because this is also where the share service's answers are collected,
+        // which has to keep happening while the dialog is shut.
+        self.share.show(ctx);
+        // A share of a document that has never been saved. The dialog asked; only this side can
+        // serialise a document, so it answers.
+        share_save(self);
+        dialogs::show(self, ctx);
+        // Above the dialogs: a refused save has to be answered, and the answer decides what
+        // happens to the user's edits.
+        crate::cloud::conflict_modal(self, ctx);
+        if moved(self) {
+            return;
+        }
+        updates_ui::show(self, ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        file_browser::show(self, ctx);
+        colors::show(self, ctx);
+        zotero::show_alert(self, ctx);
+        read_aloud::show(self, ctx);
+        crate::keytips::show(self, ctx, ui);
+        if moved(self) {
+            return;
+        }
+        keys::global_shortcuts(self, ctx);
+        if moved(self) {
+            return;
+        }
+        self.refocus_after_chrome_click(ctx);
+        if let Some(url) = self.canvas.open_url.take() {
+            ctx.open_url(egui::OpenUrl::new_tab(url));
+        }
+    }
+
+    /// Keep the window title and full-screen state in sync, then record this frame's time.
+    pub(super) fn sync_title_and_frame(&mut self, ctx: &egui::Context, t0: f64) {
+        // With native windows the viewport driver gives the window its title.
+        let title = self.window_title();
+        if title != self.sent_title {
+            if !self.windows.driven() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            }
+            self.sent_title = title;
+        }
+        self.sync_full_screen(ctx);
+        self.frame_ms = now_ms() - t0;
+        // Typing and formatting land here, after `logic` has reported.
+        self.report_dirty();
+    }
+}
